@@ -230,9 +230,51 @@ class RosettaProtPROTACModel(EMProtocol):
         Plugin.runProgram(frodockview, args, cwd=self._getExtraPath())
 
     def filterPosesStep(self):
-        # TODO: filter FRODOCK poses by compatibility with protacSmiles (and, if given,
-        # e3Ligand1/e3Ligand2), following PROTAC-Model's filtering step.
+        self._prepareLigandsForFiltering()
+        # TODO: A2 (bond order assignment via RDKit/SMILES or OpenBabel), A3 (protonation
+        # with reduce), A4 (interface residue calculation), then the per-pose filtering
+        # loop and the ranking/clustering block. See PROTAC_PROGRESS_LOG.txt.
         raise NotImplementedError
+
+    def _prepareLigandsForFiltering(self):
+        """ Block A of PROTAC-Model's filter_frodock(): one-time preparation shared by
+        every FRODOCK pose, before the per-pose filtering loop. """
+        # A1: pull the warhead (HETATM) atoms out of receptor.pdb/target.pdb into their
+        # own PDB files, so later steps (bond order assignment, interface distance
+        # calculations) can work on just the small molecule.
+        self._extractLigandPDB(self.receptorFile, self._getExtraPath('rec_lig.pdb'))
+        self._extractLigandPDB(self.targetFile, self._getExtraPath('target_lig.pdb'))
+
+    @staticmethod
+    def _extractLigandPDB(inputPdb, outputPdb):
+        """ Port of PROTAC-Model's preprocess.py::preprocess_pdb_element (Python 2 -> 3,
+        same logic). Extracts HETATM lines (the bound warhead, since waters/other
+        heteroatoms were already stripped in convertInputStep) and rewrites each one with
+        a corrected element symbol in PDB columns 77-78 (derived from the atom-name field
+        in columns 13-14, stripped of any trailing digits) - RDKit/OpenBabel need that
+        column to be right to perceive the molecule's chemistry correctly; raw PDB HETATM
+        records often leave it blank or wrong. """
+        with open(inputPdb) as f:
+            pdbLines = f.read().splitlines()
+
+        outLines = []
+        for line in pdbLines:
+            # Column slice [12:14] is the atom-name field (e.g. "C1", "N2", "H12"); skip
+            # any HETATM line where that field is empty.
+            if line[:6] == 'HETATM' and line[12:14].strip():
+                element = line[12:14].translate(str.maketrans('', '', '0123456789'))
+                if element[0] == 'H':
+                    element = ' H'
+                elif len(element) == 1:
+                    element = ' %s' % element
+                # Rebuild the line: keep columns 1-76 as-is, pad/truncate to 76, then
+                # place the fixed element symbol in columns 77-78 (PDB spec).
+                line = line[:76]
+                line = line + ' ' * (76 - len(line)) + element
+                outLines.append(line)
+
+        with open(outputPdb, 'w') as f:
+            f.write('\n'.join(outLines) + ('\n' if outLines else ''))
 
     def refineStep(self):
         # TODO: refine the filtered poses with RosettaDock via Plugin.runRosettaProgram.

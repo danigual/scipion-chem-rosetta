@@ -107,16 +107,24 @@ class Plugin(pwem.Plugin):
                             progName)
 
     @classmethod
+    def _requireToolHome(cls, toolDic):
+        """ Return toolDic['home']'s configured value, raising if the user never set it.
+        Shared by the getXProgram() helpers below so the "not configured" error is
+        consistent across tools instead of duplicated once per tool. """
+        home = cls.getVar(toolDic['home'])
+        if home is None:
+            raise FileNotFoundError(
+                '%s is not set. Point it to your %s installation '
+                '(e.g. in scipion.conf or as a shell environment variable).'
+                % (toolDic['home'], toolDic['name']))
+        return home
+
+    @classmethod
     def getFrodockProgram(cls, progName):
         """ Return the FRODOCK binary that will be used, trying the intel build first and
         falling back to the gcc build (FRODOCK ships both, e.g. frodockgrid/frodockgrid_gcc,
         and only one is guaranteed to work on a given machine). """
-        # FRODOCK_HOME as registered in _defineVariables above; None if the user never set it.
-        home = cls.getVar(FRODOCK_DIC['home'])
-        if home is None:
-            raise FileNotFoundError(
-                'FRODOCK_HOME is not set. Point it to your FRODOCK installation '
-                '(e.g. in scipion.conf or as a shell environment variable).')
+        home = cls._requireToolHome(FRODOCK_DIC)
 
         # The two candidate paths, same convention as FRODOCK's own <name>/<name>_gcc pair.
         intel = os.path.join(home, 'bin', progName)
@@ -132,6 +140,51 @@ class Plugin(pwem.Plugin):
             raise FileNotFoundError(
                 '%s not found under FRODOCK_HOME/bin (%s). Checked %s and %s.'
                 % (progName, home, intel, gcc))
+
+    @classmethod
+    def getADFRSuiteProgram(cls, progName):
+        """ Return an ADFRsuite binary (reduce, obabel, obenergy, prepare_receptor,
+        prepare_ligand...). Unlike FRODOCK, ADFRsuite ships a single build: no intel/gcc
+        fallback needed. """
+        home = cls._requireToolHome(ADFRSUITE_DIC)
+        path = os.path.join(home, 'bin', progName)
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                '%s not found under ADFRSUITE_HOME/bin (%s).' % (progName, home))
+        return path
+
+    @classmethod
+    def getVinaProgram(cls):
+        """ Return the Vina binary. No progName parameter: VINA_HOME only ever provides
+        this one program, unlike ADFRsuite/FRODOCK which bundle several. """
+        home = cls._requireToolHome(VINA_DIC)
+        path = os.path.join(home, 'bin', 'vina')
+        if not os.path.exists(path):
+            raise FileNotFoundError('vina not found under VINA_HOME/bin (%s).' % home)
+        return path
+
+    @classmethod
+    def getVoromqaProgram(cls):
+        """ Return the Voromqa binary (voronota-voromqa). Same single-program case as
+        getVinaProgram. """
+        home = cls._requireToolHome(VOROMQA_DIC)
+        path = os.path.join(home, 'bin', 'voronota-voromqa')
+        if not os.path.exists(path):
+            raise FileNotFoundError('voronota-voromqa not found under VOROMQA_HOME/bin (%s).' % home)
+        return path
+
+    @classmethod
+    def getFCCScript(cls, scriptName):
+        """ Return the path to an FCC clustering script (make_contacts.py,
+        calc_fcc_matrix.py, cluster_fcc.py, ppretty_clusters.py...). These are plain
+        Python 2 scripts, not compiled binaries: unlike the other getXProgram() helpers,
+        the caller must still prepend its own interpreter (e.g. 'python2')
+        when building the command, this only resolves the script path. """
+        home = cls._requireToolHome(FCC_DIC)
+        path = os.path.join(home, 'scripts', scriptName)
+        if not os.path.exists(path):
+            raise FileNotFoundError('%s not found under FCC_HOME/scripts (%s).' % (scriptName, home))
+        return path
 
     @classmethod
     def runProgram(cls, program, args=None, extraEnvDict=None, cwd=None):
