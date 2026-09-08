@@ -43,6 +43,20 @@ _references = ['LeaverFay2011']
 
 ROSETTA_DIC = {'name': 'rosetta', 'version': '3.12', 'home': 'ROSETTA_HOME'}
 
+# FRODOCK is a separate external tool (not Rosetta), used by the PROTAC-Model pipeline
+# for the initial global protein-protein docking step. No 'version' key: we don't pin/
+# validate a specific FRODOCK version, only that FRODOCK_HOME points somewhere real.
+FRODOCK_DIC = {'name': 'frodock', 'home': 'FRODOCK_HOME'}
+
+# The remaining four are used later, by filterPosesStep (PROTAC-Model's filter_frodock()):
+# reduce/obabel/obenergy/prepare_receptor/prepare_ligand (ADFRsuite), vina (Vina), the
+# voronota-voromqa binary (Voromqa), and the FCC clustering scripts (plain Python scripts,
+# not a compiled binary, but still resolved the same way via an env-var home directory).
+ADFRSUITE_DIC = {'name': 'adfrsuite', 'home': 'ADFRSUITE_HOME'}
+VINA_DIC = {'name': 'vina', 'home': 'VINA_HOME'}
+VOROMQA_DIC = {'name': 'voromqa', 'home': 'VOROMQA_HOME'}
+FCC_DIC = {'name': 'fcc', 'home': 'FCC_HOME'}
+
 class Plugin(pwem.Plugin):
     _homeVar = ROSETTA_DIC['home']
     _pathVars = [ROSETTA_DIC['home']]
@@ -54,6 +68,19 @@ class Plugin(pwem.Plugin):
         """ Return and write a variable in the config file. Set the Rosetta path on the computer
         """
         cls._defineVar(ROSETTA_DIC['home'], cls.getRosettaDir())
+
+        # FRODOCK_HOME: unlike ROSETTA_HOME, there's no auto-detection (no fixed folder
+        # name to search for under EM_ROOT). defaultValue=None means: if the user hasn't
+        # set FRODOCK_HOME in scipion.conf or their shell environment, this stays None.
+        cls._defineVar(FRODOCK_DIC['home'], None)
+
+        # Same story for the four tools used by filterPosesStep: no auto-detection, the
+        # user has to point each one at their local install (or a shared one on the CNB
+        # machine) via scipion.conf or the shell environment.
+        cls._defineVar(ADFRSUITE_DIC['home'], None)
+        cls._defineVar(VINA_DIC['home'], None)
+        cls._defineVar(VOROMQA_DIC['home'], None)
+        cls._defineVar(FCC_DIC['home'], None)
 
 
     @classmethod
@@ -80,12 +107,46 @@ class Plugin(pwem.Plugin):
                             progName)
 
     @classmethod
-    def runRosettaProgram(cls, program, args=None, extraEnvDict=None, cwd=None):
-        """ Internal shortcut function to launch a Rosetta program. """
+    def getFrodockProgram(cls, progName):
+        """ Return the FRODOCK binary that will be used, trying the intel build first and
+        falling back to the gcc build (FRODOCK ships both, e.g. frodockgrid/frodockgrid_gcc,
+        and only one is guaranteed to work on a given machine). """
+        # FRODOCK_HOME as registered in _defineVariables above; None if the user never set it.
+        home = cls.getVar(FRODOCK_DIC['home'])
+        if home is None:
+            raise FileNotFoundError(
+                'FRODOCK_HOME is not set. Point it to your FRODOCK installation '
+                '(e.g. in scipion.conf or as a shell environment variable).')
+
+        # The two candidate paths, same convention as FRODOCK's own <name>/<name>_gcc pair.
+        intel = os.path.join(home, 'bin', progName)
+        gcc = os.path.join(home, 'bin', '%s_gcc' % progName)
+        if os.path.exists(intel):
+            return intel
+        elif os.path.exists(gcc):
+            return gcc
+        else:
+            # Neither build is present: fail loudly with both checked paths, instead of the
+            # original PROTAC-Model script's print() + sys.exit() (which would kill the whole
+            # Scipion process, not just this step).
+            raise FileNotFoundError(
+                '%s not found under FRODOCK_HOME/bin (%s). Checked %s and %s.'
+                % (progName, home, intel, gcc))
+
+    @classmethod
+    def runProgram(cls, program, args=None, extraEnvDict=None, cwd=None):
+        """ Internal shortcut function to launch an external program (Rosetta or, e.g.,
+        FRODOCK). Not tool-specific: only builds the environment and launches the process. """
         env = cls.getEnviron()
         if extraEnvDict is not None:
             env.update(extraEnvDict)
         pwutils.runJob(None, program, args, env=env, cwd=cwd)
+
+    @classmethod
+    def runRosettaProgram(cls, program, args=None, extraEnvDict=None, cwd=None):
+        """ Kept for backwards compatibility with existing call sites; delegates to the
+        tool-agnostic runProgram. """
+        cls.runProgram(program, args, extraEnvDict, cwd)
 
     @classmethod
     def validateInstallation(cls):

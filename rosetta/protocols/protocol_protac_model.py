@@ -75,11 +75,16 @@ class RosettaProtPROTACModel(EMProtocol):
         group.addParam('inputReceptor', params.PointerParam, pointerClass='AtomStruct',
                        label='Receptor structure', allowsNull=False,
                        help='Larger of the two proteins (typically the E3 ligase). Passed '
-                            'as the FRODOCK receptor.')
+                            'as the FRODOCK receptor. Per PROTAC-Model\'s own requirements, '
+                            'this structure should already include its bound small-molecule '
+                            'warhead (as HETATM records) and exclude unrelated heteroatoms '
+                            '(crystallization waters, ions, buffer molecules, etc.).')
         group.addParam('inputTarget', params.PointerParam, pointerClass='AtomStruct',
                        label='Target structure', allowsNull=False,
                        help='Smaller of the two proteins (typically the protein of '
-                            'interest, POI). Passed as the FRODOCK docking target.')
+                            'interest, POI). Passed as the FRODOCK docking target. Same '
+                            'requirement as "Receptor structure": keep its bound warhead, '
+                            'exclude unrelated heteroatoms.')
         group.addParam('siteCoords', params.StringParam, allowsNull=False,
                        label='Receptor interface site (X,Y,Z)',
                        help='Coordinates of a point on the receptor surface, at the '
@@ -92,6 +97,19 @@ class RosettaProtPROTACModel(EMProtocol):
                        help='SMILES of the full PROTAC molecule (E3 ligand - linker - '
                             'POI warhead), used to filter FRODOCK poses by compatibility '
                             'with the linker geometry.')
+        group.addParam('receptorLigandSmiles', params.StringParam, allowsNull=True,
+                       label='Receptor-bound ligand SMILES (optional)',
+                       help='SMILES of the small-molecule warhead already bound in the '
+                            'receptor structure (equivalent to PROTAC-Model\'s -irsmi). '
+                            'RDKit can sometimes fail to assign the correct bonds for this '
+                            'ligand when reading it straight from the PDB HETATM records; '
+                            'providing its SMILES avoids that failure mode.')
+        group.addParam('targetLigandSmiles', params.StringParam, allowsNull=True,
+                       label='Target-bound ligand SMILES (optional)',
+                       help='SMILES of the small-molecule warhead already bound in the '
+                            'target structure (equivalent to PROTAC-Model\'s -itsmi). Same '
+                            'purpose as "Receptor-bound ligand SMILES", for the other '
+                            'protein.')
         group.addParam('e3Ligand1', params.PointerParam, pointerClass='SmallMolecule',
                        allowsNull=True, label='E3 ligand conformer 1 (optional)',
                        help='SDF of one possible bound conformation/orientation of the '
@@ -126,24 +144,90 @@ class RosettaProtPROTACModel(EMProtocol):
         self._insertFunctionStep(self.createOutputStep, prerequisites=[lastId])
 
     def convertInputStep(self):
-        """ Converts the receptor/target AtomStructs into the clean, waters/hetatm-free
-        PDBs that FRODOCK expects, and stages the PROTAC SMILES into extraPath. """
+        """ Converts the receptor/target AtomStructs into the clean PDBs that FRODOCK
+        expects, and stages the PROTAC SMILES into extraPath.
+        Only water is stripped here: per PROTAC-Model's own input requirements, the
+        receptor/target PDBs must keep their bound small-molecule warhead (a HETATM
+        record), so heteroatoms as a whole cannot be blanket-removed the way
+        convertInputStep did before.
+        TODO: once the warhead's residue name is known/identifiable, also strip other
+        unrelated heteroatoms (ions, buffer molecules, etc.) via cleanPDB's het2rem,
+        instead of keeping every non-water heteroatom. """
         self.receptorFile = self._getExtraPath('receptor.pdb')
         cleanPDB(self.inputReceptor.get().getFileName(), self.receptorFile,
-                waters=True, hetatm=True)
+                waters=True, hetatm=False)
 
         self.targetFile = self._getExtraPath('target.pdb')
         cleanPDB(self.inputTarget.get().getFileName(), self.targetFile,
-                waters=True, hetatm=True)
+                waters=True, hetatm=False)
 
         self.smilesFile = self._getExtraPath('protac.smi')
         with open(self.smilesFile, 'w') as f:
             f.write(self.protacSmiles.get().strip() + '\n')
 
     def frodockStep(self):
-        # TODO: run FRODOCK global rigid-body docking, guided by siteCoords, receptor vs
-        # target. FRODOCK is not wrapped by this plugin yet.
-        raise NotImplementedError
+        # STAGE 1: receptor van der Waals potential map.
+        # getFrodockProgram resolves FRODOCK_HOME/bin/frodockgrid (or its _gcc fallback).
+        frodockgrid = Plugin.getFrodockProgram('frodockgrid')
+        # self.receptorFile was written in convertInputStep (the cleaned receptor PDB).
+        # Output map goes to extraPath, e.g. <protocol>/extra/receptor_W.ccp4.
+        args = '%s -o %s' % (self.receptorFile, self._getExtraPath('receptor_W.ccp4'))
+        # runProgram just sets up the environment and launches frodockgrid with those args.
+        # cwd=extraPath: matches the rest of the repo's convention (other protocols always
+        # pass cwd), and matters here because we don't yet know whether FRODOCK writes any
+        # of its by-product files (e.g. the _ASA.pdb from stage 5's TODO) relative to CWD
+        # instead of next to the -o path - pinning CWD to extraPath keeps that debuggable.
+        Plugin.runProgram(frodockgrid, args, cwd=self._getExtraPath())
+
+        # STAGE 2: receptor electrostatic potential map (-m 1 -t E, per FRODOCK's own docs).
+        # Same binary as stage 1, just different flags/output file.
+        args = '%s -o %s -m 1 -t E' % (self.receptorFile, self._getExtraPath('receptor_E.ccp4'))
+        Plugin.runProgram(frodockgrid, args, cwd=self._getExtraPath())
+
+        # STAGE 3: receptor desolvation potential map.
+        args = '%s -o %s -m 3' % (self.receptorFile, self._getExtraPath('receptor_DS.ccp4'))
+        Plugin.runProgram(frodockgrid, args, cwd=self._getExtraPath())
+
+        # STAGE 4: target desolvation potential map. Target, not receptor this time - the
+        # docking stage (5) needs a desolvation map for both molecules.
+        args = '%s -o %s -m 3' % (self.targetFile, self._getExtraPath('target_DS.ccp4'))
+        Plugin.runProgram(frodockgrid, args, cwd=self._getExtraPath())
+
+        # STAGE 5: the actual global rigid-body docking, restricted around siteCoords.
+        frodock = Plugin.getFrodockProgram('frodock')
+        receptorASA = self._getExtraPath('receptor_ASA.pdb')
+        targetASA = self._getExtraPath('target_ASA.pdb')
+        # TODO: assumed side-effect of frodockgrid (stages 1-4) writing these _ASA.pdb
+        # files alongside the .ccp4 maps - unverified, no FRODOCK binary available
+        # locally to test.
+        args = '%s %s -w %s -e %s --th 10 -d %s,%s -t E -o %s --around %s' % (
+            receptorASA, targetASA,
+            self._getExtraPath('receptor_W.ccp4'), self._getExtraPath('receptor_E.ccp4'),
+            self._getExtraPath('receptor_DS.ccp4'), self._getExtraPath('target_DS.ccp4'),
+            self._getExtraPath('dock.dat'),
+            # Reformatted from the already-parsed tuple (not the raw form string) so stray
+            # whitespace (e.g. "12.3, -4.5, 6.7", which passes _validate's comma-count
+            # check) can't split --around into extra shell tokens.
+            '%.4f,%.4f,%.4f' % self._getSiteCoords())
+        Plugin.runProgram(frodock, args, cwd=self._getExtraPath())
+
+        # STAGE 6: cluster the raw docking poses from dock.dat (by RMSD, -d 4 Angstrom
+        # cutoff), keeping representative poses instead of thousands of near-duplicates.
+        frodockcluster = Plugin.getFrodockProgram('frodockcluster')
+        args = '%s %s -o %s -d 4 --nc 100000' % (
+            self._getExtraPath('dock.dat'), self.targetFile,
+            self._getExtraPath('clust_dock_4.dat'))
+        Plugin.runProgram(frodockcluster, args, cwd=self._getExtraPath())
+
+        # STAGE 7: extract per-pose coordinates/scores from the clustered results.
+        frodockview = Plugin.getFrodockProgram('frodockview')
+        # '>' instead of the original script's '>>': a Scipion step can be re-run
+        # (retry/resume), and append would duplicate scores into frodock_score.txt
+        # across runs.
+        args = '%s -p %s > %s' % (
+            self._getExtraPath('clust_dock_4.dat'), self.targetFile,
+            self._getExtraPath('frodock_score.txt'))
+        Plugin.runProgram(frodockview, args, cwd=self._getExtraPath())
 
     def filterPosesStep(self):
         # TODO: filter FRODOCK poses by compatibility with protacSmiles (and, if given,
