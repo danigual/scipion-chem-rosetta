@@ -52,6 +52,10 @@ from pwem.objects import AtomStruct
 
 from pwchem.objects import SmallMolecule, SetOfAtomStructsChem
 from pwchem.utils import cleanPDB
+# Aliased to pwchemPlugin: this module already needs its own rosetta.Plugin below, and
+# both packages name their Plugin class the same way.
+from pwchem import Plugin as pwchemPlugin
+from pwchem.constants import RDKIT_DIC
 
 from rosetta import Plugin
 from rosetta.constants import ROSETTA_SCRIPTS
@@ -244,6 +248,54 @@ class RosettaProtPROTACModel(EMProtocol):
         # calculations) can work on just the small molecule.
         self._extractLigandPDB(self.receptorFile, self._getExtraPath('rec_lig.pdb'))
         self._extractLigandPDB(self.targetFile, self._getExtraPath('target_lig.pdb'))
+
+        # A2.1: assign correct bond orders to each warhead (rec_lig.pdb/target_lig.pdb ->
+        # rec_lig.sdf/target_lig.sdf).
+        self._assignBondOrders(self._getExtraPath('rec_lig.pdb'),
+                               self.receptorLigandSmiles.get(),
+                               self._getExtraPath('rec_lig.sdf'))
+        self._assignBondOrders(self._getExtraPath('target_lig.pdb'),
+                               self.targetLigandSmiles.get(),
+                               self._getExtraPath('target_lig.sdf'))
+
+        # A2.2: add explicit hydrogens (needed for correct docking/scoring geometry later)
+        # and convert back to PDB. Always OpenBabel, regardless of whether A2.1 used RDKit
+        # or OpenBabel - matches the original script, which runs this pair unconditionally
+        # after the if/else.
+        self._obabelConvert('sdf', self._getExtraPath('rec_lig.sdf'),
+                            'sdf', self._getExtraPath('rec_lig_H.sdf'), addH=True)
+        self._obabelConvert('sdf', self._getExtraPath('rec_lig_H.sdf'),
+                            'pdb', self._getExtraPath('rec_lig_H.pdb'))
+        self._obabelConvert('sdf', self._getExtraPath('target_lig.sdf'),
+                            'sdf', self._getExtraPath('target_lig_H.sdf'), addH=True)
+        self._obabelConvert('sdf', self._getExtraPath('target_lig_H.sdf'),
+                            'pdb', self._getExtraPath('target_lig_H.pdb'))
+
+    def _obabelConvert(self, iformat, inFile, oformat, outFile, addH=False):
+        """ Port of PROTAC-Model's preprocess.py::obabel_convert_format, via pwchem's
+        OpenBabel conda env instead of ADFRSUITE_HOME/bin/obabel (see the design-decision
+        entry in PROTAC_PROGRESS_LOG.txt for why). -h adds explicit hydrogens; without it,
+        this is a plain format conversion. """
+        hFlag = '-h ' if addH else ''
+        args = '%s-i%s %s -o%s -O %s' % (hFlag, iformat, inFile, oformat, outFile)
+        pwchemPlugin.runOPENBABEL(self, args=args, cwd=self._getExtraPath())
+
+    def _assignBondOrders(self, ligPdb, smiles, outSdf):
+        """ Writes ligPdb's bond-order-corrected structure to outSdf. If smiles is given,
+        runs assign_bond_order.py (RDKit, template-based) with pwchem's dedicated RDKit
+        conda env. Otherwise falls back to OpenBabel's own bond perception (geometry-only,
+        less reliable, but doesn't require a reference SMILES), matching PROTAC-Model's
+        own if rec_smi != 'none' / else branch. """
+        if smiles:
+            # rosetta/scripts (this plugin's own scripts dir), not pwchem/scripts: the
+            # script lives in this repo, so runScript needs an explicit scriptDir instead
+            # of its pwchem/scripts default.
+            scriptsDir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'scripts')
+            args = '%s "%s" %s' % (ligPdb, smiles.strip(), outSdf)
+            pwchemPlugin.runScript(self, 'assign_bond_order.py', args, env=RDKIT_DIC,
+                                   cwd=self._getExtraPath(), scriptDir=scriptsDir)
+        else:
+            self._obabelConvert('pdb', ligPdb, 'sdf', outSdf)
 
     @staticmethod
     def _extractLigandPDB(inputPdb, outputPdb):
