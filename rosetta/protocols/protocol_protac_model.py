@@ -37,8 +37,10 @@ PROTAC-mediated protein-protein ternary complexes:
      anchoring orientation).
   3. Optional RosettaDock refinement of the filtered poses (slower, more accurate).
 
-TODO: this is a skeleton only. FRODOCK/ADFRsuite/Vina/Voromqa/FCC are not wired in yet -
-see CLAUDE.md (local, untracked) for the full pipeline breakdown and open questions.
+None of PROTAC-Model's own pipeline logic is reimplemented here: each phase below just
+stages arguments and launches rosetta/scripts/run_protac_model.py (a Python 2 driver,
+run under a dedicated conda env), which in turn calls straight into PROTAC-Model's own
+utils.frodock/utils.rosetta functions.
 """
 
 import os
@@ -46,19 +48,15 @@ import os
 from pyworkflow.constants import BETA
 from pyworkflow.protocol import params
 from pyworkflow.utils import Message
+import pyworkflow.object as pwobj
 
 from pwem.protocols import EMProtocol
 from pwem.objects import AtomStruct
 
-from pwchem.objects import SmallMolecule, SetOfAtomStructsChem
+from pwchem.objects import SetOfAtomStructsChem
 from pwchem.utils import cleanPDB
-# Aliased to pwchemPlugin: this module already needs its own rosetta.Plugin below, and
-# both packages name their Plugin class the same way.
-from pwchem import Plugin as pwchemPlugin
-from pwchem.constants import RDKIT_DIC
 
-from rosetta import Plugin
-from rosetta.constants import ROSETTA_SCRIPTS
+from rosetta import Plugin, PROTAC_MODEL_PYTHON_DIC
 
 
 class RosettaProtPROTACModel(EMProtocol):
@@ -149,198 +147,126 @@ class RosettaProtPROTACModel(EMProtocol):
 
     def convertInputStep(self):
         """ Converts the receptor/target AtomStructs into the clean PDBs that FRODOCK
-        expects, and stages the PROTAC SMILES into extraPath.
-        Only water is stripped here: per PROTAC-Model's own input requirements, the
-        receptor/target PDBs must keep their bound small-molecule warhead (a HETATM
-        record), so heteroatoms as a whole cannot be blanket-removed the way
-        convertInputStep did before.
+        expects. Only water is stripped here: per PROTAC-Model's own input requirements,
+        the receptor/target PDBs must keep their bound small-molecule warhead (a HETATM
+        record), so heteroatoms as a whole cannot be blanket-removed.
         TODO: once the warhead's residue name is known/identifiable, also strip other
         unrelated heteroatoms (ions, buffer molecules, etc.) via cleanPDB's het2rem,
         instead of keeping every non-water heteroatom. """
-        self.receptorFile = self._getExtraPath('receptor.pdb')
-        cleanPDB(self.inputReceptor.get().getFileName(), self.receptorFile,
+        cleanPDB(self.inputReceptor.get().getFileName(), self._getReceptorFile(),
                 waters=True, hetatm=False)
-
-        self.targetFile = self._getExtraPath('target.pdb')
-        cleanPDB(self.inputTarget.get().getFileName(), self.targetFile,
+        cleanPDB(self.inputTarget.get().getFileName(), self._getTargetFile(),
                 waters=True, hetatm=False)
-
-        self.smilesFile = self._getExtraPath('protac.smi')
-        with open(self.smilesFile, 'w') as f:
-            f.write(self.protacSmiles.get().strip() + '\n')
 
     def frodockStep(self):
-        # STAGE 1: receptor van der Waals potential map.
-        # getFrodockProgram resolves FRODOCK_HOME/bin/frodockgrid (or its _gcc fallback).
-        frodockgrid = Plugin.getFrodockProgram('frodockgrid')
-        # self.receptorFile was written in convertInputStep (the cleaned receptor PDB).
-        # Output map goes to extraPath, e.g. <protocol>/extra/receptor_W.ccp4.
-        args = '%s -o %s' % (self.receptorFile, self._getExtraPath('receptor_W.ccp4'))
-        # runProgram just sets up the environment and launches frodockgrid with those args.
-        # cwd=extraPath: matches the rest of the repo's convention (other protocols always
-        # pass cwd), and matters here because we don't yet know whether FRODOCK writes any
-        # of its by-product files (e.g. the _ASA.pdb from stage 5's TODO) relative to CWD
-        # instead of next to the -o path - pinning CWD to extraPath keeps that debuggable.
-        Plugin.runProgram(frodockgrid, args, cwd=self._getExtraPath())
+        """ Runs FRODOCK global docking by launching run_protac_model.py --phase frodock,
+        which stages its inputs (chain renaming, protac.smi, optional E3 ligand SDFs) and
+        then calls PROTAC-Model's own fro.frodock(site) - none of that logic is
+        reimplemented here. """
+        # extra/frodock/: the driver's --phase frodock/filter both run from this cwd
+        # (PROTAC-Model's own fro.frodock()/fro.filter_frodock() read/write files
+        # relative to it, e.g. 'receptor.pdb', 'protac.smi').
+        frodockDir = self._getExtraPath('frodock')
+        os.makedirs(frodockDir, exist_ok=True)
 
-        # STAGE 2: receptor electrostatic potential map (-m 1 -t E, per FRODOCK's own docs).
-        # Same binary as stage 1, just different flags/output file.
-        args = '%s -o %s -m 1 -t E' % (self.receptorFile, self._getExtraPath('receptor_E.ccp4'))
-        Plugin.runProgram(frodockgrid, args, cwd=self._getExtraPath())
+        # Absolute + quoted paths: cwd below is frodockDir (not extraPath), and the
+        # underlying shell command would otherwise split a spaced path into extra tokens.
+        receptorFile = os.path.abspath(self._getReceptorFile())
+        targetFile = os.path.abspath(self._getTargetFile())
+        # From the parsed tuple, not the raw form string, so stray whitespace can't split
+        # --site into extra shell tokens.
+        x, y, z = self._getSiteCoords()
+        site = f'{x:.4f},{y:.4f},{z:.4f}'
+        args = (f'--phase frodock --receptor "{receptorFile}" --target "{targetFile}" '
+               f'--smiles "{self.protacSmiles.get().strip()}" --site {site}')
 
-        # STAGE 3: receptor desolvation potential map.
-        args = '%s -o %s -m 3' % (self.receptorFile, self._getExtraPath('receptor_DS.ccp4'))
-        Plugin.runProgram(frodockgrid, args, cwd=self._getExtraPath())
+        # Both E3 ligand conformers, or neither: --phase filter derives lig_locate_num
+        # from this same pair (see _getLigLocateNum) - _validate() already rejects a lone
+        # conformer.
+        if self.e3Ligand1.get() is not None and self.e3Ligand2.get() is not None:
+            e3lig1 = os.path.abspath(self.e3Ligand1.get().getFileName())
+            e3lig2 = os.path.abspath(self.e3Ligand2.get().getFileName())
+            args += f' --e3lig1 "{e3lig1}" --e3lig2 "{e3lig2}"'
 
-        # STAGE 4: target desolvation potential map. Target, not receptor this time - the
-        # docking stage (5) needs a desolvation map for both molecules.
-        args = '%s -o %s -m 3' % (self.targetFile, self._getExtraPath('target_DS.ccp4'))
-        Plugin.runProgram(frodockgrid, args, cwd=self._getExtraPath())
-
-        # STAGE 5: the actual global rigid-body docking, restricted around siteCoords.
-        frodock = Plugin.getFrodockProgram('frodock')
-        receptorASA = self._getExtraPath('receptor_ASA.pdb')
-        targetASA = self._getExtraPath('target_ASA.pdb')
-        # TODO: assumed side-effect of frodockgrid (stages 1-4) writing these _ASA.pdb
-        # files alongside the .ccp4 maps - unverified, no FRODOCK binary available
-        # locally to test.
-        args = '%s %s -w %s -e %s --th 10 -d %s,%s -t E -o %s --around %s' % (
-            receptorASA, targetASA,
-            self._getExtraPath('receptor_W.ccp4'), self._getExtraPath('receptor_E.ccp4'),
-            self._getExtraPath('receptor_DS.ccp4'), self._getExtraPath('target_DS.ccp4'),
-            self._getExtraPath('dock.dat'),
-            # Reformatted from the already-parsed tuple (not the raw form string) so stray
-            # whitespace (e.g. "12.3, -4.5, 6.7", which passes _validate's comma-count
-            # check) can't split --around into extra shell tokens.
-            '%.4f,%.4f,%.4f' % self._getSiteCoords())
-        Plugin.runProgram(frodock, args, cwd=self._getExtraPath())
-
-        # STAGE 6: cluster the raw docking poses from dock.dat (by RMSD, -d 4 Angstrom
-        # cutoff), keeping representative poses instead of thousands of near-duplicates.
-        frodockcluster = Plugin.getFrodockProgram('frodockcluster')
-        args = '%s %s -o %s -d 4 --nc 100000' % (
-            self._getExtraPath('dock.dat'), self.targetFile,
-            self._getExtraPath('clust_dock_4.dat'))
-        Plugin.runProgram(frodockcluster, args, cwd=self._getExtraPath())
-
-        # STAGE 7: extract per-pose coordinates/scores from the clustered results.
-        frodockview = Plugin.getFrodockProgram('frodockview')
-        # '>' instead of the original script's '>>': a Scipion step can be re-run
-        # (retry/resume), and append would duplicate scores into frodock_score.txt
-        # across runs.
-        args = '%s -p %s > %s' % (
-            self._getExtraPath('clust_dock_4.dat'), self.targetFile,
-            self._getExtraPath('frodock_score.txt'))
-        Plugin.runProgram(frodockview, args, cwd=self._getExtraPath())
+        Plugin.runCondaScript(Plugin.getPluginScript('run_protac_model.py'), args,
+                              PROTAC_MODEL_PYTHON_DIC,
+                              extraEnvDict=Plugin.getProtacModelEnviron(), cwd=frodockDir)
 
     def filterPosesStep(self):
-        self._prepareLigandsForFiltering()
-        # TODO: A2 (bond order assignment via RDKit/SMILES or OpenBabel), A3 (protonation
-        # with reduce), A4 (interface residue calculation), then the per-pose filtering
-        # loop and the ranking/clustering block. See PROTAC_PROGRESS_LOG.txt.
-        raise NotImplementedError
+        """ Filters the FRODOCK poses by compatibility with the PROTAC/warhead geometry,
+        via run_protac_model.py --phase filter -> PROTAC-Model's own fro.filter_frodock().
+        Same cwd as frodockStep: filter_frodock() reads the files frodock() just wrote
+        there (frodock_score.txt, receptor.pdb, target.pdb...). """
+        targetSmi = self._getSmiArg(self.targetLigandSmiles)
+        recSmi = self._getSmiArg(self.receptorLigandSmiles)
+        args = (f'--phase filter --cpu {self.numberOfThreads.get()} '
+               f'--lig-locate-num {self._getLigLocateNum()} '
+               f'--target-smi "{targetSmi}" --rec-smi "{recSmi}"')
 
-    def _prepareLigandsForFiltering(self):
-        """ Block A of PROTAC-Model's filter_frodock(): one-time preparation shared by
-        every FRODOCK pose, before the per-pose filtering loop. """
-        # A1: pull the warhead (HETATM) atoms out of receptor.pdb/target.pdb into their
-        # own PDB files, so later steps (bond order assignment, interface distance
-        # calculations) can work on just the small molecule.
-        self._extractLigandPDB(self.receptorFile, self._getExtraPath('rec_lig.pdb'))
-        self._extractLigandPDB(self.targetFile, self._getExtraPath('target_lig.pdb'))
-
-        # A2.1: assign correct bond orders to each warhead (rec_lig.pdb/target_lig.pdb ->
-        # rec_lig.sdf/target_lig.sdf).
-        self._assignBondOrders(self._getExtraPath('rec_lig.pdb'),
-                               self.receptorLigandSmiles.get(),
-                               self._getExtraPath('rec_lig.sdf'))
-        self._assignBondOrders(self._getExtraPath('target_lig.pdb'),
-                               self.targetLigandSmiles.get(),
-                               self._getExtraPath('target_lig.sdf'))
-
-        # A2.2: add explicit hydrogens (needed for correct docking/scoring geometry later)
-        # and convert back to PDB. Always OpenBabel, regardless of whether A2.1 used RDKit
-        # or OpenBabel - matches the original script, which runs this pair unconditionally
-        # after the if/else.
-        self._obabelConvert('sdf', self._getExtraPath('rec_lig.sdf'),
-                            'sdf', self._getExtraPath('rec_lig_H.sdf'), addH=True)
-        self._obabelConvert('sdf', self._getExtraPath('rec_lig_H.sdf'),
-                            'pdb', self._getExtraPath('rec_lig_H.pdb'))
-        self._obabelConvert('sdf', self._getExtraPath('target_lig.sdf'),
-                            'sdf', self._getExtraPath('target_lig_H.sdf'), addH=True)
-        self._obabelConvert('sdf', self._getExtraPath('target_lig_H.sdf'),
-                            'pdb', self._getExtraPath('target_lig_H.pdb'))
-
-    def _obabelConvert(self, iformat, inFile, oformat, outFile, addH=False):
-        """ Port of PROTAC-Model's preprocess.py::obabel_convert_format, via pwchem's
-        OpenBabel conda env instead of ADFRSUITE_HOME/bin/obabel (see the design-decision
-        entry in PROTAC_PROGRESS_LOG.txt for why). -h adds explicit hydrogens; without it,
-        this is a plain format conversion. """
-        hFlag = '-h ' if addH else ''
-        args = '%s-i%s %s -o%s -O %s' % (hFlag, iformat, inFile, oformat, outFile)
-        pwchemPlugin.runOPENBABEL(self, args=args, cwd=self._getExtraPath())
-
-    def _assignBondOrders(self, ligPdb, smiles, outSdf):
-        """ Writes ligPdb's bond-order-corrected structure to outSdf. If smiles is given,
-        runs assign_bond_order.py (RDKit, template-based) with pwchem's dedicated RDKit
-        conda env. Otherwise falls back to OpenBabel's own bond perception (geometry-only,
-        less reliable, but doesn't require a reference SMILES), matching PROTAC-Model's
-        own if rec_smi != 'none' / else branch. """
-        if smiles:
-            # rosetta/scripts (this plugin's own scripts dir), not pwchem/scripts: the
-            # script lives in this repo, so runScript needs an explicit scriptDir instead
-            # of its pwchem/scripts default.
-            scriptsDir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'scripts')
-            args = '%s "%s" %s' % (ligPdb, smiles.strip(), outSdf)
-            pwchemPlugin.runScript(self, 'assign_bond_order.py', args, env=RDKIT_DIC,
-                                   cwd=self._getExtraPath(), scriptDir=scriptsDir)
-        else:
-            self._obabelConvert('pdb', ligPdb, 'sdf', outSdf)
-
-    @staticmethod
-    def _extractLigandPDB(inputPdb, outputPdb):
-        """ Port of PROTAC-Model's preprocess.py::preprocess_pdb_element (Python 2 -> 3,
-        same logic). Extracts HETATM lines (the bound warhead, since waters/other
-        heteroatoms were already stripped in convertInputStep) and rewrites each one with
-        a corrected element symbol in PDB columns 77-78 (derived from the atom-name field
-        in columns 13-14, stripped of any trailing digits) - RDKit/OpenBabel need that
-        column to be right to perceive the molecule's chemistry correctly; raw PDB HETATM
-        records often leave it blank or wrong. """
-        with open(inputPdb) as f:
-            pdbLines = f.read().splitlines()
-
-        outLines = []
-        for line in pdbLines:
-            # Column slice [12:14] is the atom-name field (e.g. "C1", "N2", "H12"); skip
-            # any HETATM line where that field is empty.
-            if line[:6] == 'HETATM' and line[12:14].strip():
-                element = line[12:14].translate(str.maketrans('', '', '0123456789'))
-                if element[0] == 'H':
-                    element = ' H'
-                elif len(element) == 1:
-                    element = ' %s' % element
-                # Rebuild the line: keep columns 1-76 as-is, pad/truncate to 76, then
-                # place the fixed element symbol in columns 77-78 (PDB spec).
-                line = line[:76]
-                line = line + ' ' * (76 - len(line)) + element
-                outLines.append(line)
-
-        with open(outputPdb, 'w') as f:
-            f.write('\n'.join(outLines) + ('\n' if outLines else ''))
+        Plugin.runCondaScript(Plugin.getPluginScript('run_protac_model.py'), args,
+                              PROTAC_MODEL_PYTHON_DIC,
+                              extraEnvDict=Plugin.getProtacModelEnviron(),
+                              cwd=self._getExtraPath('frodock'))
 
     def refineStep(self):
-        # TODO: refine the filtered poses with RosettaDock via Plugin.runRosettaProgram.
-        raise NotImplementedError
+        """ Refines the filtered poses with RosettaDock, via run_protac_model.py
+        --phase refine -> PROTAC-Model's own ros.rosetta(). Only inserted when doRefine
+        is set (see _insertAllSteps). """
+        # extra/rosetta/ must be a sibling of extra/frodock/: ros.rosetta() uses
+        # hardcoded relative paths like '../frodock/...' to reach filterPosesStep's output.
+        rosettaDir = self._getExtraPath('rosetta')
+        os.makedirs(rosettaDir, exist_ok=True)
+
+        targetSmi = self._getSmiArg(self.targetLigandSmiles)
+        recSmi = self._getSmiArg(self.receptorLigandSmiles)
+        args = (f'--phase refine --cpu {self.numberOfThreads.get()} '
+               f'--lig-locate-num {self._getLigLocateNum()} '
+               f'--target-smi "{targetSmi}" --rec-smi "{recSmi}"')
+
+        Plugin.runCondaScript(Plugin.getPluginScript('run_protac_model.py'), args,
+                              PROTAC_MODEL_PYTHON_DIC,
+                              extraEnvDict=Plugin.getProtacModelEnviron(), cwd=rosettaDir)
 
     def createOutputStep(self):
-        # TODO: collect the final (filtered, optionally refined) ternary complex models
-        # into a SetOfAtomStructsChem, one AtomStruct per model, with its docking/filter
-        # score as an attribute.
-        outputSet = SetOfAtomStructsChem.create(self._getPath())
+        """ Collects the final (filtered, optionally refined) ternary complex models into
+        a SetOfAtomStructsChem, one AtomStruct per model, with its VoroMQA interface score
+        (more negative = better) as a dynamic attribute. """
+        if self.doRefine.get():
+            resultsDir = self._getExtraPath('rosetta_results', 'all')
+            resultsFile = os.path.join(resultsDir, 'results_rosetta.txt')
+        else:
+            resultsDir = self._getExtraPath('frodock_results', 'all')
+            resultsFile = os.path.join(resultsDir, 'results_frodock.txt')
+
+        outputSet = SetOfAtomStructsChem().create(self._getPath())
+        with open(resultsFile) as f:
+            for line in f:
+                # No header, 2 columns: "<pose_id> <score>" (verified against
+                # PROTAC-Model's own utils/frodock.py and utils/rosetta.py).
+                if not line.strip():
+                    continue
+                poseId, score = line.split()[:2]
+                pdbFile = os.path.join(resultsDir, f'model_merge_{poseId}.pdb')
+                if not os.path.exists(pdbFile):
+                    self.info(f'Skipping pose {poseId}: {pdbFile} not found.')
+                    continue
+                atomStruct = AtomStruct(filename=pdbFile)
+                atomStruct.setObjLabel(f'model_merge_{poseId}')
+                # Dynamic attribute (AtomStruct has no built-in score field), same
+                # mechanism protocol_flexDDG.py uses for its own per-item scores; name
+                # matches pwchem's own '_score' convention (pwchem.objects.base).
+                atomStruct._score = pwobj.Float(float(score))
+                outputSet.append(atomStruct)
 
         self._defineOutputs(outputTernaryModels=outputSet)
         self._defineSourceRelation(self.inputReceptor, outputSet)
         self._defineSourceRelation(self.inputTarget, outputSet)
+        # Only when actually used: e3Ligand1/e3Ligand2 influence which poses survive
+        # filtering (see _getLigLocateNum), so they belong in the provenance graph too.
+        if self.e3Ligand1.get() is not None:
+            self._defineSourceRelation(self.e3Ligand1, outputSet)
+        if self.e3Ligand2.get() is not None:
+            self._defineSourceRelation(self.e3Ligand2, outputSet)
 
     # --------------------------- INFO functions -----------------------------------
     def _validate(self):
@@ -348,17 +274,35 @@ class RosettaProtPROTACModel(EMProtocol):
 
         if self._getSiteCoords() is None:
             errors.append('"Receptor interface site (X,Y,Z)" must be 3 comma-separated '
-                          'numbers, e.g. "12.3,-4.5,6.7". Got: "%s".' % self.siteCoords.get())
+                          f'numbers, e.g. "12.3,-4.5,6.7". Got: "{self.siteCoords.get()}".')
 
         if self.e3Ligand2.get() is not None and self.e3Ligand1.get() is None:
             errors.append('"E3 ligand conformer 2" was set without "E3 ligand conformer 1". '
                           'Set conformer 1 first, or clear conformer 2.')
 
-        # TODO: once FRODOCK/RosettaDock are wired in, check their binaries are available.
+        # getProtacModelEnviron() covers all 6 external tool homes (FRODOCK, ADFRsuite,
+        # Vina, Voromqa, FCC, Rosetta) in one call; getProtacModelPython() additionally
+        # checks the dedicated Python 2.7 env exists. Both raise FileNotFoundError on the
+        # first missing one rather than returning a list, so only that first problem is
+        # ever reported per _validate() call - acceptable, the user fixes one at a time.
+        for check in (Plugin.getProtacModelEnviron, Plugin.getProtacModelPython):
+            try:
+                check()
+            except FileNotFoundError as e:
+                errors.append(str(e))
+
         return errors
 
     def _summary(self):
         summary = []
+        # Set/Object.get() is for scalar attributes and always returns None on a Set -
+        # isFinished() plus the hasattr check (set by _defineOutputs) is the right test,
+        # matching protocol_flexDDG.py's own _summary().
+        if self.isFinished() and hasattr(self, 'outputTernaryModels'):
+            models = self.outputTernaryModels
+            bestScore = min(model._score.get() for model in models)
+            summary.append(f'Generated {len(models)} ternary complex model(s); best '
+                           f'(most negative) interface score: {bestScore:.2f}.')
         return summary
 
     def _citations(self):
@@ -374,5 +318,32 @@ class RosettaProtPROTACModel(EMProtocol):
             return tuple(float(p.strip()) for p in parts)
         except ValueError:
             return None
+
+    def _getReceptorFile(self):
+        """ Cleaned receptor PDB written by convertInputStep. Recomputed from extraPath
+        (not cached as an instance attribute) since each step can run in its own
+        process. """
+        return self._getExtraPath('receptor.pdb')
+
+    def _getTargetFile(self):
+        """ Cleaned target PDB written by convertInputStep. Same recompute-not-cache
+        reasoning as _getReceptorFile. """
+        return self._getExtraPath('target.pdb')
+
+    def _getLigLocateNum(self):
+        """ 2 when both E3 ligand conformers are given (ambiguous anchoring orientation,
+        e.g. thalidomide-based degraders), 1 otherwise - matches PROTAC-Model's own
+        main.py logic (lig_locate_num). """
+        if self.e3Ligand1.get() is not None and self.e3Ligand2.get() is not None:
+            return 2
+        return 1
+
+    @staticmethod
+    def _getSmiArg(smilesParam):
+        """ 'none' is PROTAC-Model's own convention (main.py/utils.frodock) for "no
+        SMILES given" - it isn't a value a real SMILES string could take, so a stripped,
+        non-empty param value is passed through unchanged. """
+        value = smilesParam.get()
+        return value.strip() if value else 'none'
 
 
