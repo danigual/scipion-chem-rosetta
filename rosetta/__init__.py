@@ -147,9 +147,14 @@ class Plugin(pwem.Plugin):
         installer = InstallHelper(ADFRSUITE_DIC['name'], packageHome=cls.getVar(ADFRSUITE_DIC['home']),
                                   packageVersion=ADFRSUITE_DIC['version'])
         installer.addCommand(
+            # install.sh doesn't cd to its own folder before looking for its sibling
+            # tarballs (Python2.7.tar.gz, etc.) - it must be run with cwd inside the
+            # extracted folder, not invoked as './ADFRsuite*/install.sh' from outside it.
+            # Confirmed on the CNB VM (2026-09-10): running it from outside made it search
+            # for Python*.tar.gz one level up from where it actually was.
             'wget -q https://ccsb.scripps.edu/adfr/download/1038/ -O adfrsuite.tar.gz && '
             'tar -xzf adfrsuite.tar.gz && '
-            './ADFRsuite*/install.sh -d . -c 0',
+            '(cd ADFRsuite_x86_64Linux_1.0 && ./install.sh -d .. -c 0)',
             targetName=f"{ADFRSUITE_DIC['name']}_installed")
         installer.addPackage(env, dependencies=['wget', 'tar'], default=default)
 
@@ -230,9 +235,8 @@ class Plugin(pwem.Plugin):
         with this genuinely-Python-2 codebase).
         RDKit's own channel stopped publishing py2.7 builds after 2016.03.3 (checked
         anaconda.org/rdkit/rdkit's full file list, 2026-09-10) - pinned explicitly below.
-        XXX: that build is tied to a specific old numpy ("np111py27"); unverified whether
-        conda's solver picks a compatible numpy on its own or needs one pinned too -
-        check on first real install. """
+        Confirmed on a real install: conda's solver picks a compatible numpy (1.11.3) on
+        its own, no manual pin needed. """
         installer = InstallHelper(PROTAC_MODEL_PYTHON_DIC['name'],
                                   packageHome=cls.getVar(PROTAC_MODEL_PYTHON_DIC['home']),
                                   packageVersion=PROTAC_MODEL_PYTHON_DIC['version'])
@@ -384,9 +388,8 @@ class Plugin(pwem.Plugin):
             # FCC_HOME is the parent InstallHelper cloned into; the actual FCC root
             # PROTAC-Model expects is one level down - same reasoning as getFCCScript().
             'FCC': os.path.join(cls._requireToolHome(FCC_DIC), FCC_DIC['name']),
-            # XXX unverified: whether ROSETTA_HOME's auto-detected rosetta_bin_linux*
-            # layout matches the $ROSETTA/main/source/bin/... path utils/rosetta.py
-            # expects - no real Rosetta install available locally to check.
+            # Confirmed on a real install: ROSETTA_HOME's rosetta_bin_linux* layout
+            # matches the $ROSETTA/main/source/bin/... path utils/rosetta.py expects.
             'ROSETTA': cls._requireToolHome(ROSETTA_DIC),
             'PROTAC_MODEL_HOME': cls.getProtacModelScript(),
         }
